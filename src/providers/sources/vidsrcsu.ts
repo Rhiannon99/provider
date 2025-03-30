@@ -1,49 +1,114 @@
 import { flags } from '@/entrypoint/utils/targets';
-import { SourcererOutput, makeSourcerer } from '@/providers/base';
+import { SourcererEmbed, SourcererOutput, makeSourcerer } from '@/providers/base';
 import { MovieScrapeContext, ShowScrapeContext } from '@/utils/context';
 import { NotFoundError } from '@/utils/errors';
+
+const getHost = () => {
+  const urlObj = new URL(window.location.href);
+  return `${urlObj.protocol}//${urlObj.host}`;
+};
 
 async function comboScraper(ctx: ShowScrapeContext | MovieScrapeContext): Promise<SourcererOutput> {
   const embedPage = await ctx.proxiedFetcher(
     `https://vidsrc.su/embed/${ctx.media.type === 'movie' ? `movie/${ctx.media.tmdbId}` : `tv/${ctx.media.tmdbId}/${ctx.media.season.number}/${ctx.media.episode.number}`}`,
+    {
+      headers: {
+        Referer: getHost(),
+      },
+    },
+  );
+  // eslint-disable-next-line no-console
+  console.log('host', getHost());
+
+  ctx.progress(30);
+
+  const decodedPeterMatch = embedPage.match(/decodeURIComponent\('([^']+)'\)/);
+  const decodedPeterUrl = decodedPeterMatch ? decodeURIComponent(decodedPeterMatch[1]) : null;
+
+  const serverMatches = [...embedPage.matchAll(/label: 'Server (\d+)', url: '(https.*)'/g)];
+
+  const servers = serverMatches.map((match) => ({
+    serverNumber: parseInt(match[1], 10),
+    url: match[2],
+  }));
+
+  if (decodedPeterUrl) {
+    servers.push({
+      serverNumber: 40,
+      url: decodedPeterUrl,
+    });
+  }
+
+  ctx.progress(60);
+
+  if (!servers.length) throw new NotFoundError('No server playlist found');
+
+  // Process orbitproxy.ru URLs so we can proxy yourself
+  // REQUIRES A PROXY FOR MOST SERVERS set it up here https://github.com/Pasithea0/M3U8-Proxy
+  const processedServers = await Promise.all(
+    servers.map(async (server) => {
+      if (server.url.includes('orbitproxy')) {
+        try {
+          const urlParts = server.url.split(/orbitproxy\.[^/]+\//);
+          if (urlParts.length >= 2) {
+            const encryptedPart = urlParts[1].split('.m3u8')[0];
+
+            try {
+              const decodedData = Buffer.from(encryptedPart, 'base64').toString('utf-8');
+              // eslint-disable-next-line no-console
+              console.log('Decoded data:', decodedData);
+
+              const jsonData = JSON.parse(decodedData);
+
+              const originalUrl = jsonData.u;
+              // const origin = jsonData.o || '';
+              const referer = jsonData.r || '';
+
+              const encodedUrl = encodeURIComponent(originalUrl);
+              const encodedHeaders = encodeURIComponent(
+                JSON.stringify({
+                  // origin,
+                  referer,
+                }),
+              );
+
+              const proxyUrl = `https://m3u8.wafflehacker.io/m3u8-proxy?url=${encodedUrl}&headers=${encodedHeaders}`; // bring your own
+              // eslint-disable-next-line no-console
+              console.log('Created proxy URL:', proxyUrl);
+
+              return {
+                ...server,
+                url: proxyUrl,
+              };
+            } catch (jsonError) {
+              // eslint-disable-next-line no-console
+              console.error('Error decoding/parsing orbitproxy data:', jsonError);
+              return server;
+            }
+          }
+        } catch (error) {
+          // eslint-disable-next-line no-console
+          console.error('Error processing orbitproxy URL:', error);
+        }
+      }
+      return server;
+    }),
   );
 
-  const servers = [...embedPage.matchAll(/label: 'Server (1|2|3|5|7|8|10|11)', url: '(https.*)'/g)] // only server 1,2 and 3 are flixhq
-    .sort((a, b) => {
-      // ranking for servers
-      const ranks: Record<string, number> = {
-        '7': 10,
-        '11': 20,
-        '10': 30,
-        '1': 40,
-        '3': 50,
-        '2': 60,
-        '5': 70,
-        '8': 80,
-      }; // server 8 > 5 > 2 ...
-      return ranks[b[1]] - ranks[a[1]];
-    })
-    .map((x) => x[2]);
-
-  if (!servers[0]) throw new NotFoundError('No flixhq playlist found');
+  const embeds: SourcererEmbed[] = processedServers.map((server) => ({
+    embedId: `server-${server.serverNumber}`,
+    url: server.url,
+  }));
+  ctx.progress(90);
 
   return {
-    embeds: [],
-    stream: [
-      {
-        id: 'primary',
-        playlist: servers[0],
-        type: 'hls',
-        flags: [flags.CORS_ALLOWED],
-        captions: [],
-      },
-    ],
+    embeds,
   };
 }
 export const vidsrcsuScraper = makeSourcerer({
   id: 'vidsrcsu',
-  name: 'vidsrc.su (FlixHQ)',
-  rank: 229,
+  name: 'vidsrc.su',
+  rank: 150,
   flags: [flags.CORS_ALLOWED],
   scrapeMovie: comboScraper,
   scrapeShow: comboScraper,
